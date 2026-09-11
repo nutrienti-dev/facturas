@@ -1,0 +1,17 @@
+# Secrets - NEVER commit these
+.streamlit/secrets.toml
+credentials.json
+*.json
+!package.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+.env
+
+# OS
+.DS_Store
+Thumbs.db
