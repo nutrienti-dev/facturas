@@ -16,6 +16,7 @@ from . import matching
 CLIENTS_MASTER_FILE_ID = "16GFApKVxoQ1mVURvCpgbDGNmwjCGbeka"       # BASE DE DATOS CLIENTES ACTIVOS.xlsx
 PRICES_SHEET_ID = "1HMNBT9Qqogz3WgZIenm-jB9wTUP7Ta_NP1BhUhoB3-s"   # Nutrienti - Precios por Cliente (World Office)
 PEDIDOS_SHEET_ID = "1WKkqvaM27VDxCviwNPWKEI5xKblDH-vgQEi9_5oiQNY"  # Pedidos Web - Registro de Solicitudes
+RAZONES_SOCIALES_SHEET_ID = "1_IbW0IhpSxiCVL9Xn97XsIe5wE4AWnWMjG8szdoWSNI"  # RAZONES SOCIALES - NOMBRES COMERCIALES
 INTEGRACION_AI_FOLDER_ID = "1I84GZo517GSPCmUQZVThxqdTODckhrmZ"
 FACTURAS_FOLDER_ID = "1pcD7kT1X6MO2ltpxwro-D7gk19Du975a"
 
@@ -86,6 +87,40 @@ def load_pedidos(gc):
     return rows
 
 
+def load_nombre_comercial_map(gc):
+    """Carga la hoja "RAZONES SOCIALES - NOMBRES COMERCIALES", la fuente de
+    verdad para resolver el punto de venta (nombre comercial, tal como llega
+    en los pedidos) a su razon social oficial. Muchos puntos no tienen
+    ningun parecido textual con la razon social ni con la "empresa" de la
+    lista de precios (ej. "Astoria" / "Bombay" / "Sexy Seoul" son puntos de
+    la razon social "ALTAS VISTAS SAS"), asi que no se puede seguir
+    dependiendo solo de que el nombre del punto empiece igual que la cadena.
+    """
+    ws = gc.open_by_key(RAZONES_SOCIALES_SHEET_ID).sheet1
+    records = ws.get_all_records()
+    rows = []
+    for r in records:
+        # Las llaves de get_all_records() vienen tal cual el encabezado de
+        # la hoja, que trae espacios inconsistentes (ej. "RAZON SOCIAL "
+        # con espacio al final) - se buscan de forma robusta en vez de
+        # asumir el nombre exacto de la columna.
+        razon = ""
+        nombre_comercial = ""
+        for k, v in r.items():
+            key_norm = str(k or "").strip().lower()
+            if key_norm == "razon social":
+                razon = str(v or "").strip()
+            elif key_norm == "nombre comercial":
+                nombre_comercial = str(v or "").strip()
+        if not nombre_comercial:
+            continue
+        rows.append({
+            "razon_social": razon or nombre_comercial,
+            "nombre_comercial": nombre_comercial,
+        })
+    return rows
+
+
 _CLIENT_COLS = {
     "razon_social": "Primer Nombre ó Razon Social",
     "nit": "Identificación",
@@ -130,7 +165,8 @@ def load_client_master(drive_service):
 # ---------------------------------------------------------------------------
 # Cruce de pedidos + precios + base de clientes
 # ---------------------------------------------------------------------------
-def cross_reference(pedidos_rows, precios_rows, client_master_rows):
+def cross_reference(pedidos_rows, precios_rows, client_master_rows, nombre_comercial_rows=None):
+    nombre_comercial_rows = nombre_comercial_rows or []
     empresas = get_empresas(precios_rows)
     precios_by_empresa = {}
     for r in precios_rows:
@@ -138,19 +174,68 @@ def cross_reference(pedidos_rows, precios_rows, client_master_rows):
 
     enriched = []
     for p in pedidos_rows:
+        # Para MOSTRAR/agrupar preferimos la sugerencia automatica (viene con
+        # mejor capitalizacion, ej. "La biferia Santafe"). Pero para CRUZAR
+        # contra nuestra lista de precios usamos primero el texto tal como lo
+        # escribio el punto: la "sugerencia automatica" la calcula la app de
+        # pedidos contra SU propia lista de 380 clientes, que es distinta de
+        # nuestra lista de empresas/precios, y si el cliente real no esta en
+        # esa lista puede sugerir algo completamente distinto (caso real:
+        # "takami" se sugirio como "Osaka", y ambos son empresas validas en
+        # nuestra lista, asi que el error no se detecta solo). Por eso el
+        # texto ingresado manda, y la sugerencia solo se usa de respaldo.
         cliente_para_match = p["cliente_sugerido"] or p["cliente_texto"]
-        empresa_matched, score_empresa = matching.match_empresa(cliente_para_match, empresas)
+        candidatos = [p["cliente_texto"], p["cliente_sugerido"]]
+
+        empresa_matched = None
+        score_empresa = 0.0
+        cliente_master = None
+
+        # 1) Fuente de verdad: el mapa "RAZONES SOCIALES - NOMBRES
+        #    COMERCIALES". Muchos puntos de venta no tienen ningun parecido
+        #    textual con la cadena/empresa (ej. "Astoria"/"Bombay"/"Sexy
+        #    Seoul" son puntos de la razon social "ALTAS VISTAS SAS"), asi
+        #    que primero se resuelve el punto contra este mapa y de ahi se
+        #    saca la razon social real.
+        razon_social_mapeada, nombre_comercial_mapeado, score_mapa = matching.match_nombre_comercial(
+            candidatos, nombre_comercial_rows
+        )
+        if razon_social_mapeada:
+            cliente_master = matching.find_client_master_by_razon(razon_social_mapeada, client_master_rows)
+            lista_precios = (cliente_master or {}).get("lista_precios", "")
+            if lista_precios:
+                lista_norm = matching.normalize(lista_precios)
+                for emp in empresas:
+                    if matching.normalize(emp) == lista_norm:
+                        empresa_matched = emp
+                        score_empresa = score_mapa
+                        break
+
+        # 2) Respaldo: si el punto no esta en el mapa, o el cliente
+        #    correspondiente no tiene "Lista Precios" diligenciada en la
+        #    base de clientes activos, se usa el comportamiento anterior -
+        #    cruzar el texto del pedido directamente contra las "empresas"
+        #    de la lista de precios (funciona para las cadenas donde el
+        #    nombre del punto si empieza igual que la cadena, ej. "la
+        #    biferia santafe" -> empresa "La biferia").
+        if not empresa_matched:
+            empresa_matched, score_empresa = matching.match_empresa(p["cliente_texto"], empresas)
+            if not empresa_matched and p["cliente_sugerido"]:
+                empresa_matched, score_empresa = matching.match_empresa(p["cliente_sugerido"], empresas)
+
+        if cliente_master is None:
+            cliente_master = matching.match_client_master(empresa_matched, candidatos, client_master_rows)
 
         precio_row = None
         if empresa_matched:
             precio_row = matching.match_product(p["producto"], precios_by_empresa.get(empresa_matched, []))
 
-        cliente_master = matching.match_client_master(empresa_matched, cliente_para_match, client_master_rows)
-
         row = dict(p)
         row["cliente_para_match"] = cliente_para_match
         row["empresa_matched"] = empresa_matched or NO_APARECE
         row["similitud_empresa"] = score_empresa
+        row["razon_social_mapeada"] = razon_social_mapeada or NO_APARECE
+        row["nombre_comercial_mapeado"] = nombre_comercial_mapeado or NO_APARECE
         row["precio_encontrado"] = precio_row is not None
         row["codigo"] = precio_row["codigo"] if precio_row else NO_APARECE
         row["descripcion_precio"] = precio_row["descripcion"] if precio_row else NO_APARECE
@@ -173,7 +258,9 @@ def cross_reference(pedidos_rows, precios_rows, client_master_rows):
 
 OUTPUT_HEADERS = [
     "Fecha Solicitud", "Fecha Despacho Deseada", "Cliente (texto ingresado)",
-    "Cliente (sugerencia automatica)", "Empresa (lista de precios)",
+    "Cliente (sugerencia automatica)",
+    "Punto (mapa nombres comerciales)", "Razon social (mapa)",
+    "Empresa (lista de precios)",
     "Similitud empresa (%)", "Producto", "Unidad", "Cantidad",
     "Codigo", "Precio unitario", "Valor total", "Precio encontrado",
     "Cliente oficial (razon social)", "NIT", "Direccion", "Ciudad",
@@ -186,7 +273,9 @@ def enriched_to_rows(enriched):
     for r in enriched:
         rows.append([
             r["fecha_solicitud"], r["fecha_despacho"], r["cliente_texto"],
-            r["cliente_sugerido"], r["empresa_matched"], r["similitud_empresa"],
+            r["cliente_sugerido"],
+            r.get("nombre_comercial_mapeado", NO_APARECE), r.get("razon_social_mapeada", NO_APARECE),
+            r["empresa_matched"], r["similitud_empresa"],
             r["producto"], r["unidad"], r["cantidad"],
             r["codigo"], r["precio_unitario"] if r["precio_unitario"] is not None else NO_APARECE,
             r["valor_total"] if r["valor_total"] is not None else NO_APARECE,
