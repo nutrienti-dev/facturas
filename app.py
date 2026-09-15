@@ -90,10 +90,30 @@ if cruzar_clicked:
             pedidos_rows = data.load_pedidos(gc)
             precios_rows = data.load_precios(gc)
             client_master_rows = data.load_client_master(drive_service)
-            enriched = data.cross_reference(pedidos_rows, precios_rows, client_master_rows)
         except Exception as e:
             st.error(f"No se pudo cargar o cruzar la informacion: {e}")
             st.stop()
+
+        try:
+            nombre_comercial_rows = data.load_nombre_comercial_map(gc)
+        except Exception as e:
+            # La hoja "RAZONES SOCIALES - NOMBRES COMERCIALES" es de otra
+            # cuenta (csanchez@nutrienti.co) - si no esta compartida con la
+            # cuenta de la app no se puede leer. No se detiene el cruce por
+            # esto: se sigue con el respaldo (texto ingresado directo contra
+            # empresas de la lista de precios), pero se avisa para que se
+            # revise el permiso de la hoja.
+            nombre_comercial_rows = []
+            st.warning(
+                "No se pudo leer la hoja 'RAZONES SOCIALES - NOMBRES COMERCIALES' "
+                f"({e}). Revisa que este compartida con la cuenta de Google que usa "
+                "esta app. El cruce sigue funcionando con el respaldo anterior "
+                "(nombre del punto vs. nombre de la cadena)."
+            )
+
+        enriched = data.cross_reference(
+            pedidos_rows, precios_rows, client_master_rows, nombre_comercial_rows
+        )
 
     with st.spinner("Escribiendo resultado en Google Sheets..."):
         try:
