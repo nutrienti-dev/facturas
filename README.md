@@ -13,19 +13,29 @@ Drive.
    ingresado), Cliente (sugerencia automatica), Similitud (%), Producto,
    Unidad, Cantidad).
 2. **Cruza cada línea** contra:
+   - La hoja ["RAZONES SOCIALES - NOMBRES
+     COMERCIALES"](https://docs.google.com/spreadsheets/d/1_IbW0IhpSxiCVL9Xn97XsIe5wE4AWnWMjG8szdoWSNI)
+     (columnas: RAZON SOCIAL, NOMBRE COMERCIAL, ...) — **fuente de verdad**
+     para resolver el punto de venta del pedido a su razón social oficial.
+     Muchos puntos NO tienen ningún parecido con el nombre de la cadena ni
+     con la razón social (ej. "Astoria"/"Bombay"/"Sexy Seoul" son puntos de
+     "ALTAS VISTAS SAS"; "Osaki"/"Sorella"/"Caccio y Pepe" son puntos de
+     "TAKAMI SA"), así que este mapa se consulta primero.
    - La hoja ["Nutrienti - Precios por Cliente (World
      Office)"](https://docs.google.com/spreadsheets/d/1HMNBT9Qqogz3WgZIenm-jB9wTUP7Ta_NP1BhUhoB3-s)
-     (columnas: empresa, codigo, descripcion, unidad, precio) — el nombre
-     de cliente del pedido normalmente trae el punto/sede (ej. "La biferia
-     Santafe"), así que se hace *fuzzy matching* contra el nombre de la
-     cadena/empresa ("La biferia") ignorando el punto. Todos los puntos de
-     una misma cadena comparten precio.
+     (columnas: empresa, codigo, descripcion, unidad, precio) — una vez se
+     sabe la razón social del punto, se usa la columna "Lista Precios" del
+     cliente en la base de clientes activos para encontrar la "empresa"
+     exacta de esta hoja (que a veces es el nombre de la cadena y a veces
+     un nombre de marca sin relación con la razón social, ej. "Storia de
+     Amore" para la razón social "AMORE GROUP SAS"). Si el punto no está en
+     el mapa de razones sociales, se usa como respaldo el comportamiento
+     anterior: *fuzzy matching* del texto del pedido contra el nombre de la
+     empresa (funciona cuando el punto sí empieza igual que la cadena, ej.
+     "la biferia santafe" → "La biferia").
    - `BASE DE DATOS CLIENTES ACTIVOS.xlsx` (subido a Drive, exportado de
      World Office) para traer NIT, dirección, ciudad, teléfono, forma de
-     pago y plazo de días de crédito del cliente oficial. Se usa primero la
-     columna "Lista Precios" (cuando está diligenciada, enlaza directo con
-     la empresa de la hoja de precios) y si no, fuzzy matching de la razón
-     social.
+     pago y plazo de días de crédito del cliente oficial.
    - Si no se encuentra precio o cliente con suficiente confianza, el campo
      queda como **"no aparece"** (nunca se inventa un valor).
 3. **Escribe el resultado** en una Google Sheet nueva llamada "Nutrienti -
@@ -55,17 +65,28 @@ Drive.
 ## Matching (fuzzy) — cómo funciona y qué tan estricto es
 
 Todo el matching vive en `lib/matching.py` y usa `difflib` (librería
-estándar de Python, sin dependencias externas). Tres pasos:
+estándar de Python, sin dependencias externas). El cruce (`cross_reference`
+en `lib/data.py`) sigue este orden de prioridad para cada línea de pedido:
 
-- `match_empresa`: normaliza texto (sin tildes, minúsculas) y busca la
-  "empresa" de la hoja de precios cuyo nombre es prefijo del texto del
-  cliente del pedido (ej. "la biferia" es prefijo de "la biferia
-  santafe" → 100% de similitud). Si no hay prefijo exacto, usa similitud
-  de texto (umbral 72%).
-- `match_client_master`: primero busca coincidencia exacta contra la
-  columna "Lista Precios" de la base de clientes; si no la hay, compara la
-  razón social (quitando sufijos como SAS, S.A., LTDA) contra la empresa
-  encontrada o el texto del pedido (umbral 60%).
+1. `match_nombre_comercial`: busca el texto del cliente del pedido (texto
+   ingresado y sugerencia automática) contra la columna "NOMBRE COMERCIAL"
+   de la hoja "RAZONES SOCIALES - NOMBRES COMERCIALES" (umbral 72%). Esta
+   es la fuente de verdad — resuelve puntos cuyo nombre no tiene ninguna
+   relación con la cadena/razón social.
+2. Si se encontró razón social en el paso 1, `find_client_master_by_razon`
+   busca esa razón social en la base de clientes activos (ignorando
+   sufijos como SAS, S.A., LTDA) y se usa directamente su columna "Lista
+   Precios" para identificar la "empresa" exacta de la hoja de precios.
+3. Si el punto no está en el mapa, o el cliente no tiene "Lista Precios"
+   diligenciada, se usa el comportamiento de respaldo: `match_empresa`
+   normaliza texto (sin tildes, minúsculas) y busca la "empresa" de la
+   hoja de precios cuyo nombre es prefijo del texto del cliente del pedido
+   (ej. "la biferia" es prefijo de "la biferia santafe" → 100% de
+   similitud); si no hay prefijo exacto, usa similitud de texto (umbral
+   72%). Luego `match_client_master` busca coincidencia exacta contra
+   "Lista Precios", o si no la hay, compara la razón social (quitando
+   sufijos societarios) contra la empresa encontrada o el texto del
+   pedido (umbral 60%).
 - `match_product`: compara el nombre de producto del pedido contra las
   descripciones de precio de esa empresa (umbral 78%).
 
@@ -74,12 +95,19 @@ ahí si el negocio los quiere más estrictos o más flexibles. Cuando ningún
 candidato supera el umbral, el campo correspondiente queda en
 **"no aparece"** en vez de forzar un match dudoso.
 
-> Ejemplo real encontrado en los datos de prueba: el pedido "Mix central
-> cevicheria x kilo" para el cliente "Central cevicheria chia" no tiene
-> ninguna empresa "Central cevicheria" en la lista de precios (ese texto
-> solo aparece como nombre de un producto dentro de la lista de "Takami"),
-> así que queda correctamente en "no aparece" — no se le asigna el precio
-> de otro cliente por error.
+La hoja de resultado incluye dos columnas de transparencia — "Punto (mapa
+nombres comerciales)" y "Razon social (mapa)" — que muestran, cuando
+aplica, con qué fila del mapa de razones sociales se resolvió cada línea
+(quedan en "no aparece" cuando el punto no está en ese mapa y se usó el
+respaldo).
+
+> Ejemplos reales verificados con datos de prueba: "astoria santafe" y
+> "bombay 127" (sin ningún parecido textual con "Altas Vistas") ahora
+> resuelven correctamente a la razón social "ALTAS VISTAS S.A.S" y a la
+> empresa de precios "Altas Vistas"; "central cevicheria chia" resuelve a
+> "TAKAMI S.A." (antes quedaba en "no aparece" porque "Central cevicheria"
+> no es una empresa de la lista de precios — solo aparecía como nombre de
+> un producto dentro de la lista de Takami).
 
 ## Autenticación con Google
 
@@ -100,6 +128,14 @@ Si al correr la app aparece un error de permisos de Drive, es porque el
 refresh_token reutilizado se autorizó originalmente con un scope más
 angosto — en ese caso hay que rehacer el consentimiento OAuth pidiendo
 `https://www.googleapis.com/auth/drive` explícitamente.
+
+La hoja "RAZONES SOCIALES - NOMBRES COMERCIALES" la creó
+`csanchez@nutrienti.co`; ya está compartida con `contacto@nutrienti.co`
+(Editor), que es la cuenta que usa esta app, así que no hace falta ningún
+ajuste de permisos. Si en algún momento dejara de estar compartida, la app
+lo detecta sola: muestra una advertencia en pantalla y sigue funcionando
+con el comportamiento de respaldo (sin el mapa de razones sociales) en vez
+de detenerse.
 
 ## Instalar y correr localmente
 
